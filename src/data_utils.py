@@ -10,9 +10,20 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error
 
 
 TARGET = "PM25"
-LOOKBACK = 336       
-HORIZON = 8         
+LOOKBACK = 336
+HORIZON = 8
+
+# Mặc định trước đây dùng log1p cho target.
+# Giữ lại cờ USE_LOG_TARGET để tương thích ngược,
+# nhưng ưu tiên dùng tham số transform trong hàm transform_target.
 USE_LOG_TARGET = True
+
+# Các lựa chọn transform cho target:
+# - "log"  : log1p(x)
+# - "sqrt" : sqrt(x)
+# - "none" : giữ nguyên
+TARGET_TRANSFORM = "log"
+
 DATA_PATH = "data/processed/data2225_done.csv"
 
 
@@ -104,14 +115,59 @@ def split_data(df):
 
 
 
-def transform_target(train_df, val_df, test_df, target=TARGET, use_log=USE_LOG_TARGET):
+def transform_target(
+    train_df,
+    val_df,
+    test_df,
+    target=TARGET,
+    transform: str | None = None,
+    use_log: bool | None = None,
+):
+    """
+    Biến đổi target theo nhiều lựa chọn khác nhau (log / sqrt / none)
+    mà vẫn đảm bảo không rò rỉ dữ liệu (scaler fit trên train).
+
+    Thứ tự ưu tiên:
+    1) Nếu tham số `transform` được truyền (\"log\" / \"sqrt\" / \"none\"),
+       sẽ dùng trực tiếp.
+    2) Nếu `transform` = None nhưng `use_log` không None -> dùng use_log
+       (True -> \"log\", False -> \"none\") để tương thích với code cũ.
+    3) Nếu cả hai đều None -> dùng TARGET_TRANSFORM / USE_LOG_TARGET.
+    """
+
+    # Xác định chế độ transform
+    if transform is not None:
+        mode = transform.lower()
+    elif use_log is not None:
+        mode = "log" if use_log else "none"
+    else:
+        # Backward compatible: ưu tiên TARGET_TRANSFORM nếu hợp lệ,
+        # nếu không thì quay về USE_LOG_TARGET.
+        if str(TARGET_TRANSFORM).lower() in {"log", "sqrt", "none"}:
+            mode = str(TARGET_TRANSFORM).lower()
+        else:
+            mode = "log" if USE_LOG_TARGET else "none"
+
+    if mode not in {"log", "sqrt", "none"}:
+        raise ValueError(f"Unknown target transform mode: {mode}")
+
     def forward(y):
         y = np.asarray(y, dtype=np.float64)
-        return np.log1p(np.clip(y, 0, None)) if use_log else y
+        y = np.clip(y, 0, None)
+        if mode == "log":
+            return np.log1p(y)
+        if mode == "sqrt":
+            return np.sqrt(y)
+        return y
 
     def inverse(y):
         y = np.asarray(y, dtype=np.float64)
-        return np.expm1(y) if use_log else y
+        if mode == "log":
+            return np.expm1(y)
+        if mode == "sqrt":
+            # Đảm bảo không sinh giá trị âm do nhiễu số
+            return np.square(np.clip(y, 0, None))
+        return y
 
     y_train_raw = train_df[[target]].values
     y_val_raw = val_df[[target]].values
