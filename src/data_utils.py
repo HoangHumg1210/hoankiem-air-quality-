@@ -35,6 +35,10 @@ class DataConfig:
 
 CFG = DataConfig()
 
+TARGET_FEATURE_LAGS = (1, 3, 6, 12, 24, 48, 72, 168)
+TARGET_FEATURE_WINDOWS = (24, 72, 168)
+TARGET_FEATURE_HISTORY = max(max(TARGET_FEATURE_LAGS), max(TARGET_FEATURE_WINDOWS))
+
 
 # =========================
 # REPRODUCIBILITY
@@ -261,13 +265,26 @@ def add_time_features(df: pd.DataFrame) -> pd.DataFrame:
 def add_target_features(df: pd.DataFrame, target: str) -> pd.DataFrame:
     df = df.copy()
 
-    for lag in [1, 3, 6, 12, 24, 48]:
+    active_lags = [lag for lag in TARGET_FEATURE_LAGS if lag < len(df)]
+    active_windows = [window for window in TARGET_FEATURE_WINDOWS if window < len(df)]
+
+    for lag in active_lags:
         df[f"{target}_lag{lag}"] = df[target].shift(lag)
 
     # Dùng shift(1) để tránh leakage.
-    df[f"{target}_roll_mean_24"] = df[target].shift(1).rolling(24).mean()
-    df[f"{target}_roll_std_24"] = df[target].shift(1).rolling(24).std()
-    df[f"{target}_roll_mean_72"] = df[target].shift(1).rolling(72).mean()
+    shifted = df[target].shift(1)
+    for window in active_windows:
+        df[f"{target}_roll_mean_{window}"] = shifted.rolling(window).mean()
+        df[f"{target}_roll_std_{window}"] = shifted.rolling(window).std()
+        df[f"{target}_roll_max_{window}"] = shifted.rolling(window).max()
+        df[f"{target}_roll_min_{window}"] = shifted.rolling(window).min()
+
+    if len(df) > 1:
+        df[f"{target}_ewm_mean_24"] = shifted.ewm(span=24, adjust=False).mean()
+        df[f"{target}_diff_1"] = shifted.diff(1)
+    if len(df) > 24:
+        df[f"{target}_ewm_mean_72"] = shifted.ewm(span=72, adjust=False).mean()
+        df[f"{target}_diff_24"] = shifted.diff(24)
 
     return df.dropna()
 
@@ -398,7 +415,7 @@ def _prepare_dataset_from_raw_splits(
     cfg: DataConfig,
     verbose: bool = True,
 ):
-    target_feature_history = 72
+    target_feature_history = TARGET_FEATURE_HISTORY
     history_len = cfg.lookback + target_feature_history
 
     train_processed = _process_frame(raw_train_df, target=cfg.target)

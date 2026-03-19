@@ -99,12 +99,19 @@ class PrepareDatasetSmokeTests(unittest.TestCase):
     def test_prepare_dataset_real_data_smoke(self):
         artifacts = prepare_dataset(CFG)
 
-        self.assertEqual(artifacts["X_train_seq"].shape, (16746, 336, 43))
-        self.assertEqual(artifacts["X_val_seq"].shape, (8713, 336, 43))
-        self.assertEqual(artifacts["X_test_seq"].shape, (8689, 336, 43))
-        self.assertEqual(artifacts["y_train_seq"].shape, (16746, 72))
-        self.assertEqual(artifacts["y_val_seq"].shape, (8713, 72))
-        self.assertEqual(artifacts["y_test_seq"].shape, (8689, 72))
+        self.assertEqual(artifacts["X_train_seq"].shape[1], CFG.lookback)
+        self.assertEqual(artifacts["X_val_seq"].shape[1], CFG.lookback)
+        self.assertEqual(artifacts["X_test_seq"].shape[1], CFG.lookback)
+        self.assertEqual(artifacts["y_train_seq"].shape[1], CFG.horizon)
+        self.assertEqual(artifacts["y_val_seq"].shape[1], CFG.horizon)
+        self.assertEqual(artifacts["y_test_seq"].shape[1], CFG.horizon)
+        self.assertEqual(artifacts["X_train_seq"].shape[2], artifacts["n_features"])
+        self.assertEqual(artifacts["X_val_seq"].shape[2], artifacts["n_features"])
+        self.assertEqual(artifacts["X_test_seq"].shape[2], artifacts["n_features"])
+        self.assertGreaterEqual(artifacts["n_features"], 43)
+        self.assertGreater(artifacts["X_train_seq"].shape[0], 16000)
+        self.assertEqual(artifacts["X_val_seq"].shape[0], 8713)
+        self.assertEqual(artifacts["X_test_seq"].shape[0], 8689)
 
 
 if __name__ == "__main__":

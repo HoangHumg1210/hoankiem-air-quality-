@@ -90,9 +90,13 @@ class WalkForwardSmokeTests(unittest.TestCase):
         folds = prepare_walk_forward_datasets(CFG, max_folds=2)
 
         self.assertEqual(len(folds), 2)
-        self.assertEqual(folds[0]["X_val_seq"].shape, (8713, 336, 43))
+        self.assertEqual(folds[0]["X_val_seq"].shape[0], 8713)
         self.assertEqual(folds[1]["X_val_seq"].shape[0], 8689)
-        self.assertEqual(folds[1]["X_val_seq"].shape[1], 336)
+        self.assertEqual(folds[0]["X_val_seq"].shape[1], CFG.lookback)
+        self.assertEqual(folds[1]["X_val_seq"].shape[1], CFG.lookback)
+        self.assertEqual(folds[0]["X_val_seq"].shape[2], folds[0]["n_features"])
+        self.assertEqual(folds[1]["X_val_seq"].shape[2], folds[1]["n_features"])
+        self.assertGreaterEqual(folds[0]["n_features"], 43)
         self.assertEqual(folds[0]["X_test_seq"].shape[0], 0)
         self.assertEqual(folds[1]["X_test_seq"].shape[0], 0)
 
