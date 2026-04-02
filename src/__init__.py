@@ -756,7 +756,7 @@ updates = {
                     "mean_chunk_3_mae": walkforward_df["chunk_3_mae"].mean(),
                 }
             ])
-            print("\\n=== Validation summary ===")
+            print("\\n=== Bảng tóm tắt validation ===")
             display(val_summary_df)
 
 
