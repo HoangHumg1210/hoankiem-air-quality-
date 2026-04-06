@@ -469,8 +469,12 @@ updates = {
                     x_scaler=x_scaler,
                     lookback=lookback,
                 )
-                y_pred_scaled = model.predict(X_input, verbose=0)
-                y_pred = inverse_target(y_pred_scaled[0], y_scaler, mode=target_mode)
+                y_pred_scaled_full = model.predict(X_input, verbose=0)[0]
+                y_pred = inverse_target(
+                    y_pred_scaled_full[:len(chunk_future)],
+                    y_scaler,
+                    mode=target_mode,
+                )
 
                 for step_idx, (timestamp, y_true_value, y_pred_value) in enumerate(
                     zip(chunk_future.index, chunk_future["PM25"].to_numpy(dtype=np.float64), y_pred),
@@ -728,7 +732,7 @@ updates = {
                 "best_inner_val_loss": float(np.min(history.history["val_loss"])),
             }
 
-            for chunk_id in range(1, N_CHUNKS + 1):
+            for chunk_id in chunk_metrics_df.index.tolist():
                 chunk_metrics = chunk_metrics_df.loc[chunk_id]
                 fold_record[f"chunk_{chunk_id}_mae"] = chunk_metrics["mae"]
                 fold_record[f"chunk_{chunk_id}_rmse"] = chunk_metrics["rmse"]
@@ -743,19 +747,29 @@ updates = {
             fold_rows.append(fold_record)
 
         walkforward_df = pd.DataFrame(fold_rows)
-        print("=== Walk-forward validation: production 72h rollout = 24h x 3 ===")
+        print(
+            f"=== Walk-forward validation: production rollout = "
+            f"{ROLLOUT_HORIZON} steps = {CHUNK_HORIZON} x {N_CHUNKS} ==="
+        )
         display(walkforward_df)
 
         if not walkforward_df.empty:
-            val_summary_df = pd.DataFrame([
-                {
-                    "mean_rollout_mae": walkforward_df["rollout_mae"].mean(),
-                    "mean_rollout_rmse": walkforward_df["rollout_rmse"].mean(),
-                    "mean_chunk_1_mae": walkforward_df["chunk_1_mae"].mean(),
-                    "mean_chunk_2_mae": walkforward_df["chunk_2_mae"].mean(),
-                    "mean_chunk_3_mae": walkforward_df["chunk_3_mae"].mean(),
-                }
-            ])
+            val_summary = {
+                "mean_rollout_mae": walkforward_df["rollout_mae"].mean(),
+                "mean_rollout_rmse": walkforward_df["rollout_rmse"].mean(),
+            }
+            chunk_mae_cols = sorted(
+                [
+                    col for col in walkforward_df.columns
+                    if len(col.split("_")) == 3 and col.startswith("chunk_") and col.endswith("_mae")
+                ],
+                key=lambda col: int(col.split("_")[1]),
+            )
+            for col in chunk_mae_cols:
+                chunk_id = int(col.split("_")[1])
+                val_summary[f"mean_chunk_{chunk_id}_mae"] = walkforward_df[col].mean()
+
+            val_summary_df = pd.DataFrame([val_summary])
             print("\\n=== Bảng tóm tắt validation ===")
             display(val_summary_df)
 
