@@ -7,6 +7,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
+from inference import forecast_recursive, load_model_bundle, prepare_raw_frame
 
 st.set_page_config(
     page_title="PM2.5 Forecast Dashboard",
@@ -16,21 +17,14 @@ st.set_page_config(
 
 
 DATA_PATH = Path(__file__).resolve().parent / "data" / "processed" / "data2225_done.csv"
-
-MODEL_SCORES = {
-    "CNN - GRU (Best Model)": {"MAE": 5.82, "RMSE": 8.11, "MAPE": 12.67, "R2": 0.921},
-    "Seq2Seq GRU": {"MAE": 6.41, "RMSE": 8.89, "MAPE": 13.58, "R2": 0.908},
-    "Seq2Seq LSTM": {"MAE": 6.73, "RMSE": 9.21, "MAPE": 14.02, "R2": 0.897},
-    "TCN": {"MAE": 6.96, "RMSE": 9.47, "MAPE": 14.31, "R2": 0.889},
-    "Transformer": {"MAE": 7.18, "RMSE": 9.79, "MAPE": 14.85, "R2": 0.879},
-}
+REGISTRY_PATH = Path(__file__).resolve().parent / "model_registry"
 
 MODEL_COLORS = {
-    "CNN - GRU (Best Model)": "#17b26a",
-    "Seq2Seq GRU": "#5b8def",
-    "Seq2Seq LSTM": "#8b5cf6",
-    "TCN": "#60a5fa",
-    "Transformer": "#f59e0b",
+    "CNN-GRU + Attention": "#17b26a",
+    "Seq2Seq GRU + Attention": "#5b8def",
+    "Seq2Seq LSTM + Attention": "#8b5cf6",
+    "Seq2Seq TCN": "#60a5fa",
+    "Encoder-only Transformer": "#f59e0b",
 }
 
 
@@ -39,6 +33,66 @@ def load_data() -> pd.DataFrame:
     df = pd.read_csv(DATA_PATH)
     df["Local Time"] = pd.to_datetime(df["Local Time"])
     return df.sort_values("Local Time").reset_index(drop=True)
+
+
+@st.cache_data(show_spinner=False)
+def load_model_frame() -> pd.DataFrame:
+    model_df = prepare_raw_frame(load_data(), step_hours=3).reset_index()
+    model_df["Local Time"] = pd.to_datetime(model_df["Local Time"])
+    return model_df.sort_values("Local Time").reset_index(drop=True)
+
+
+@st.cache_data(show_spinner=False)
+def load_registry_metrics() -> pd.DataFrame:
+    rows = []
+    for bundle_dir in sorted(REGISTRY_PATH.iterdir()):
+        if not bundle_dir.is_dir() or bundle_dir.name.startswith("."):
+            continue
+
+        metrics_path = bundle_dir / "metrics.json"
+        config_path = bundle_dir / "config.json"
+        timeline_path = bundle_dir / "test_timeline.csv"
+        if not metrics_path.exists() or not config_path.exists():
+            continue
+
+        metrics = pd.read_json(metrics_path, typ="series")
+        config = pd.read_json(config_path, typ="series")
+        rows.append(
+            {
+                "Model": str(config["model_name"]),
+                "Bundle Key": str(config["bundle_key"]),
+                "Bundle Dir": str(bundle_dir),
+                "MAE": float(metrics["mae"]),
+                "RMSE": float(metrics["rmse"]),
+                "MAPE": float(metrics["mape"]),
+                "Peak MAE": float(metrics["peak_mae"]),
+                "Has Timeline": timeline_path.exists(),
+            }
+        )
+
+    metrics_df = pd.DataFrame(rows)
+    if metrics_df.empty:
+        return metrics_df
+    return metrics_df.sort_values(["MAE", "RMSE", "MAPE"]).reset_index(drop=True)
+
+
+@st.cache_resource(show_spinner=False)
+def load_bundle_cached(bundle_dir: str):
+    return load_model_bundle(bundle_dir)
+
+
+@st.cache_data(show_spinner=False)
+def load_backtest_series(bundle_dir: str) -> pd.DataFrame:
+    timeline_path = Path(bundle_dir) / "test_timeline.csv"
+    if not timeline_path.exists():
+        return pd.DataFrame(columns=["Local Time", "PM25", "Predicted"])
+
+    timeline_df = pd.read_csv(timeline_path)
+    timeline_df["timestamp"] = pd.to_datetime(timeline_df["timestamp"])
+    backtest_df = timeline_df.rename(
+        columns={"timestamp": "Local Time", "y_true": "PM25", "y_pred": "Predicted"}
+    )
+    return backtest_df[["Local Time", "PM25", "Predicted"]].tail(36).reset_index(drop=True)
 
 
 def clean_model_name(name: str) -> str:
@@ -84,64 +138,42 @@ def safe_pct_change(current: float, future: float) -> float:
     return (future - current) / current * 100
 
 
-def build_forecast(history: pd.DataFrame, horizon: int, model_name: str) -> pd.DataFrame:
-    pm25 = history["PM25"].astype(float)
-    last_time = history["Local Time"].iloc[-1]
-    hours = pd.date_range(last_time + pd.Timedelta(hours=1), periods=horizon, freq="h")
+def make_future_covariates(history: pd.DataFrame, required_cols: list[str], step_hours: int, steps: int) -> pd.DataFrame:
+    if history.empty:
+        raise ValueError("History is empty, cannot build future covariates.")
 
-    recent = pm25.tail(max(24, min(72, len(pm25))))
-    anchor = recent.tail(min(12, len(recent))).mean()
-    drift = recent.diff().tail(8).mean()
-    if pd.isna(drift):
-        drift = 0.0
+    base_row = history.iloc[-1]
+    future_index = pd.date_range(
+        history["Local Time"].iloc[-1] + pd.Timedelta(hours=step_hours),
+        periods=steps,
+        freq=f"{step_hours}h",
+    )
+    future = pd.DataFrame({"Local Time": future_index})
+    for col in required_cols:
+        if col == "PM25":
+            continue
+        future[col] = base_row[col]
+    return future
 
-    phase = np.linspace(0.0, np.pi, horizon)
-    daily_wave = 6.5 * np.sin(phase - 0.55)
-    trend = np.linspace(0.0, drift * horizon * 0.25, horizon)
-    settle = np.linspace(pm25.iloc[-1], anchor, horizon)
 
-    model_bias = {
-        "CNN - GRU (Best Model)": 0.0,
-        "Seq2Seq GRU": 1.4,
-        "Seq2Seq LSTM": 2.2,
-        "TCN": 2.8,
-        "Transformer": 1.8,
-    }[model_name]
-
-    forecast_values = np.clip(settle + daily_wave + trend + model_bias, 8, 135)
-    forecast = pd.DataFrame({"Local Time": hours, "PM25": forecast_values.round(2)})
+def build_forecast(history: pd.DataFrame, horizon_hours: int, bundle_dir: str) -> pd.DataFrame:
+    bundle = load_bundle_cached(bundle_dir)
+    horizon_steps = max(1, horizon_hours // bundle.step_hours)
+    future_covariates = make_future_covariates(
+        history=history,
+        required_cols=bundle.required_raw_columns,
+        step_hours=bundle.step_hours,
+        steps=horizon_steps,
+    )
+    forecast_df = forecast_recursive(
+        bundle,
+        history_df=history,
+        future_covariates_df=future_covariates,
+        horizon=horizon_steps,
+    )
+    forecast = forecast_df.rename(columns={"y_pred": "PM25"})[["Local Time", "PM25"]].copy()
     forecast["Category"] = forecast["PM25"].apply(lambda value: pm25_band(float(value))[0])
     return forecast
-
-
-def build_backtest_series(history: pd.DataFrame) -> pd.DataFrame:
-    actual = history.tail(36).copy()
-    smoothed = (
-        actual["PM25"]
-        .shift(1)
-        .fillna(actual["PM25"].iloc[0])
-        .rolling(4, min_periods=1)
-        .mean()
-        .mul(0.96)
-        .add(1.8)
-    )
-    actual["Predicted"] = smoothed.round(2)
-    return actual
-
-
-def model_metrics_frame() -> pd.DataFrame:
-    rows = []
-    for model, metrics in MODEL_SCORES.items():
-        rows.append(
-            {
-                "Model": clean_model_name(model),
-                "MAE": metrics["MAE"],
-                "RMSE": metrics["RMSE"],
-                "MAPE": metrics["MAPE"],
-                "R2": metrics["R2"],
-            }
-        )
-    return pd.DataFrame(rows)
 
 
 def build_forecast_table(forecast: pd.DataFrame, current_pm25: float) -> pd.DataFrame:
@@ -322,7 +354,7 @@ def html_model_table(metrics: pd.DataFrame, best_model_name: str) -> str:
                 <td>{row["MAE"]:.2f}</td>
                 <td>{row["RMSE"]:.2f}</td>
                 <td>{row["MAPE"]:.2f}%</td>
-                <td>{row["R2"]:.3f}</td>
+                <td>{row["Peak MAE"]:.2f}</td>
             </tr>
             """
         )
@@ -335,7 +367,7 @@ def html_model_table(metrics: pd.DataFrame, best_model_name: str) -> str:
                 <th>MAE</th>
                 <th>RMSE</th>
                 <th>MAPE</th>
-                <th>R2</th>
+                <th>Peak MAE</th>
             </tr>
         </thead>
         <tbody>
@@ -483,7 +515,7 @@ def make_model_compare_chart(metrics: pd.DataFrame) -> go.Figure:
     return fig
 
 
-def make_backtest_chart(backtest_df: pd.DataFrame) -> go.Figure:
+def make_backtest_chart(backtest_df: pd.DataFrame, model_name: str) -> go.Figure:
     fig = go.Figure()
     fig.add_trace(
         go.Scatter(
@@ -500,7 +532,7 @@ def make_backtest_chart(backtest_df: pd.DataFrame) -> go.Figure:
             x=backtest_df["Local Time"],
             y=backtest_df["Predicted"],
             mode="lines",
-            name="Du bao - CNN GRU",
+            name=f"Du bao - {clean_model_name(model_name)}",
             line={"color": "#22c55e", "width": 3, "dash": "dot", "shape": "spline"},
             hovertemplate="%{x|%H:%M %d/%m}<br>PM2.5: %{y:.1f} ug/m3<extra>Du bao</extra>",
         )
@@ -1130,36 +1162,45 @@ def inject_css() -> None:
 
 def main() -> None:
     inject_css()
-    df = load_data()
+    model_df = load_model_frame()
+    metrics_df = load_registry_metrics()
+    if metrics_df.empty:
+        st.error("Khong tim thay artifact hop le trong model_registry.")
+        return
 
-    best_model = min(MODEL_SCORES.items(), key=lambda item: item[1]["MAE"])
-    latest_dataset_time = df["Local Time"].iloc[-1].strftime("%H:%M - %d/%m/%Y")
+    best_model_row = metrics_df.iloc[0]
+    best_model_name = str(best_model_row["Model"])
+    latest_dataset_time = model_df["Local Time"].iloc[-1].strftime("%H:%M - %d/%m/%Y")
 
     with st.sidebar:
         st.markdown(
-            html_sidebar_brand(best_model[0], latest_dataset_time, len(df)),
+            html_sidebar_brand(best_model_name, latest_dataset_time, len(model_df)),
             unsafe_allow_html=True,
         )
         st.markdown('<div class="sidebar-caption">Tuy chinh du bao</div>', unsafe_allow_html=True)
-        model_name = st.selectbox("Chon mo hinh", list(MODEL_SCORES.keys()), index=0)
+        model_options = metrics_df["Model"].tolist()
+        model_name = st.selectbox("Chon mo hinh", model_options, index=model_options.index(best_model_name))
         horizon = st.slider("So gio du bao", min_value=6, max_value=48, value=24, step=6)
         history_hours = st.slider("So gio lich su hien thi", min_value=12, max_value=48, value=24, step=4)
         st.button("Du bao", type="primary")
 
-    history = df.tail(max(240, history_hours + 72)).copy()
-    chart_history = history.tail(history_hours)
+    selected_metrics = metrics_df.loc[metrics_df["Model"] == model_name].iloc[0]
+    bundle_dir = str(selected_metrics["Bundle Dir"])
+    bundle = load_bundle_cached(bundle_dir)
+
+    history = model_df.copy()
+    history_steps = max(4, history_hours // bundle.step_hours)
+    chart_history = history.tail(history_steps)
     current_row = history.iloc[-1]
     current_pm25 = float(current_row["PM25"])
-    forecast = build_forecast(history, horizon, model_name)
+    forecast = build_forecast(history, horizon, bundle_dir)
     next_pm25 = float(forecast["PM25"].iloc[0])
     next_label, _ = pm25_band(next_pm25)
     band_label, band_color = pm25_band(current_pm25)
     delta = next_pm25 - current_pm25
     delta_pct = safe_pct_change(current_pm25, next_pm25)
     latest_time = current_row["Local Time"].strftime("%H:%M - %d/%m/%Y")
-    metrics_df = model_metrics_frame()
-    selected_metrics = MODEL_SCORES[model_name]
-    backtest_df = build_backtest_series(history)
+    backtest_df = load_backtest_series(bundle_dir)
     forecast_table = build_forecast_table(forecast, current_pm25)
 
     st.markdown(
@@ -1172,7 +1213,7 @@ def main() -> None:
                 </div>
             </div>
             <div class="hero-meta">
-                <div class="meta-pill">Best Model: {clean_model_name(best_model[0])}</div>
+                <div class="meta-pill">Best Model: {clean_model_name(best_model_name)}</div>
                 <div class="meta-pill">Horizon: {horizon} gio</div>
                 <div class="meta-pill">Cap nhat: {latest_time}</div>
             </div>
@@ -1262,7 +1303,7 @@ def main() -> None:
     st.markdown(
         html_section_header(
             "Danh gia chat luong mo hinh",
-            "So sanh nhanh hieu nang 5 mo hinh Deep Learning tren cung tap kiem tra.",
+            "So sanh nhanh hieu nang cac mo hinh tren artifact test da luu trong model_registry.",
         ),
         unsafe_allow_html=True,
     )
@@ -1272,8 +1313,8 @@ def main() -> None:
         st.markdown(
             html_metric_card(
                 "Model tot nhat",
-                clean_model_name(best_model[0]),
-                f"R2 = {best_model[1]['R2']:.3f}",
+                clean_model_name(best_model_name),
+                f"Peak MAE = {best_model_row['Peak MAE']:.2f}",
                 "#17b26a",
                 "TOP",
             ),
@@ -1321,19 +1362,19 @@ def main() -> None:
 
     bt_col, note_col = st.columns([1.35, 0.8], gap="large")
     with bt_col:
-        st.plotly_chart(make_backtest_chart(backtest_df), use_container_width=True)
+        st.plotly_chart(make_backtest_chart(backtest_df, model_name), use_container_width=True)
     with note_col:
         st.markdown(
             f"""
             <div class="conclusion-card">
                 <div class="section-title">Ket luan</div>
-                <b>{clean_model_name(best_model[0])}</b> dang cho ket qua on dinh nhat voi
-                MAE <b>{best_model[1]['MAE']:.2f}</b> va R2 <b>{best_model[1]['R2']:.3f}</b>.
-                Giao dien da duoc doi sang kieu dashboard product: KPI noi bat, chart sach hon,
-                bang du lieu co phan cap va sidebar giong mockup hon de ban demo de tai.
+                <b>{clean_model_name(best_model_name)}</b> dang cho ket qua on dinh nhat voi
+                MAE <b>{best_model_row['MAE']:.2f}</b> va Peak MAE <b>{best_model_row['Peak MAE']:.2f}</b>.
+                Dashboard hien da doc metric va backtest that tu artifact trong `model_registry`,
+                dong thoi forecast o panel tren duoc sinh boi model da train thay vi du lieu gia lap.
                 <br><br>
-                Neu muon sat mockup them nua, buoc tiep theo la gan icon SVG, logo truong va du lieu
-                du bao tu model that trong `models/`.
+                Gio app da dung `inference.py`; buoc tiep theo hop ly nhat la bo hardcode cu va
+                viet script promote de cap nhat `best_model_bundle` tu dong.
             </div>
             """,
             unsafe_allow_html=True,
